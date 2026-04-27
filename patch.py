@@ -1,90 +1,69 @@
-all_candidates: list[_CandidateMatch] = []
+df = df.drop_duplicates(
+        subset=["source_table", "source_column", "target_table", "target_column", "parent"],
+        keep="first"
+    ).reset_index(drop=True)
 
-        for stmt in parseable:
-            stmt_tgt = _extract_stmt_target_table(stmt["parsed"])
-            if not tgt_tbl:
-                tgt_match = True
-            elif not stmt_tgt:
-                tgt_match = True
-            else:
-                tgt_match = _table_matches(tgt_tbl, stmt_tgt)
 
-            src_alias: str | None = None
+
+return list(seen.keys())[0] if len(seen) == 1 else " | ".join(seen.keys())
+return list(seen.keys())
+
+
+
+return " | ".join(dict.fromkeys(results)) if results else None
+return list(dict.fromkeys(results)) if results else None
+
+
+
+if not raw_logic or raw_logic in (TRANSFORM_NF, STATIC_FALLBACK):
+                continue
+if not raw_logic:
+                continue
+            raw_logics = raw_logic if isinstance(raw_logic, list) else [raw_logic]
+            raw_logics = [l for l in raw_logics if l not in (TRANSFORM_NF, STATIC_FALLBACK)]
+            if not raw_logics:
+                continue
+
+
+all_candidates.append(_CandidateMatch(
+                logic      = raw_logic,
+                uuid       = stmt["uuid"],
+                score      = score,
+                is_literal = _is_literal_expr(raw_logic),
+            ))
+for logic_item in raw_logics:
+                all_candidates.append(_CandidateMatch(
+                    logic      = logic_item,
+                    uuid       = stmt["uuid"],
+                    score      = score,
+                    is_literal = _is_literal_expr(logic_item),
+                ))
+
+
+
+src_alias: str | None = None
             if src_tbl:
                 try:
                     src_alias = _resolve_source_alias(stmt["parsed"], src_tbl)
                 except Exception:
                     pass
 
-            try:
-                if is_static:
-                    raw_logic = _extract_static_target_logic(stmt["parsed"], tgt_col)
-                else:
-                    raw_logic = extract_transformation(
-                        stmt["parsed"], src_col, tgt_col, False, src_alias
-                    )
-            except Exception as ex:
-                errors.append(f"[EXTRACT WARN] {Path(file_path).name} pair {src_col}->{tgt_col}: {ex}")
-                continue
+src_alias: str | None = None
+            if src_tbl:
+                try:
+                    src_alias = _resolve_source_alias(stmt["parsed"], src_tbl)
+                except Exception:
+                    pass
 
-            if not raw_logic or raw_logic in (TRANSFORM_NF, STATIC_FALLBACK):
-                continue
-
-            src_confirmed = _expr_refs_source(raw_logic, src_tbl, src_alias, is_static)
-            score = 3 if (tgt_match and src_confirmed) else (2 if tgt_match else 1)
-
-            all_candidates.append(_CandidateMatch(
-                logic=raw_logic, uuid=stmt["uuid"],
-                score=score, is_literal=_is_literal_expr(raw_logic),
-            ))
-
-        # ── Select best candidate(s) ──────────────────────────────────────────
-        found_logic = TRANSFORM_NF
-        found_uuid  = default_uuid
-
-        if all_candidates:
-            best_score = max(c.score for c in all_candidates)
-            top = [c for c in all_candidates if c.score == best_score]
-            if is_static:
-                lit_top = [c for c in top if c.is_literal]
-                top = lit_top or top
-
-            seen: dict[str, str] = {}
-            for c in top:
-                if c.logic not in seen:
-                    seen[c.logic] = c.uuid
-
-            if len(seen) == 1:
-                found_logic, found_uuid = next(iter(seen.items()))
-                results.append({**pair, "transformation_logic": found_logic, "query_uuid": found_uuid})
-                continue
-            else:
-                for logic_val, uuid_val in seen.items():
-                    results.append({**pair, "transformation_logic": logic_val, "query_uuid": uuid_val})
-                continue
-
-        # ── Post-scan outcome (only reached when all_candidates is empty) ─────
-        if found_logic == TRANSFORM_NF:
-            if is_static:
-                static_lit_logic = ""
-                static_lit_uuid  = default_uuid
-                for stmt in parseable:
-                    try:
-                        expr = _extract_static_target_logic(stmt["parsed"], tgt_col)
-                        if expr and expr != STATIC_FALLBACK:
-                            static_lit_logic = expr
-                            static_lit_uuid  = stmt["uuid"]
-                            if _is_literal_expr(expr):
-                                break
-                    except Exception:
-                        pass
-                if static_lit_logic:
-                    found_logic = static_lit_logic
-                    found_uuid  = static_lit_uuid
-                else:
-                    found_logic = STATIC_FALLBACK
-            elif failed_stmts:
-                found_logic = PARSE_FAILED
-                found_uuid  = failed_stmts[0]["uuid"]
-
-        results.append({**pair, "transformation_logic": found_logic, "query_uuid": found_uuid})
+            # If expression references a qualified alias (T1.col, T2.col etc.)
+            # verify that alias resolves to src_tbl. If src_tbl exists in the
+            # statement but alias couldn't be resolved, skip this statement —
+            # we cannot confirm the expression belongs to the correct source.
+            if raw_logics:
+                for logic_item in raw_logics:
+                    qualifier = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\.", logic_item.strip())
+                    if qualifier:
+                        expr_alias = qualifier.group(1).upper()
+                        if src_alias and expr_alias != src_alias:
+                            # Expression references different table — skip
+                            raw_logics = [l for l in raw_logics if not re.match(rf"^{expr_alias}\.", l.strip(), re.I)]
