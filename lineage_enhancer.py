@@ -52,8 +52,8 @@ STATIC_MARKERS = {
 }
 
 TRANSFORM_NOT_FOUND = "TRANSFORM_NOT_FOUND"
-STATIC_FALLBACK = "STATIC_FALLBACK"
-DIRECT_PASSTHRU = "Direct pass through"
+STATIC_FALLBACK = "STATIC_VALUE"
+DIRECT_PASSTHRU = "DIRECT_PASS_THROUGH"
 
 
 @dataclass
@@ -134,31 +134,55 @@ def _split_statements(sql_text: str) -> List[str]:
 
 def _is_pure_ddl(stmt: str) -> bool:
     s = _norm(stmt)
+    has_select_body = bool(re.search(r"\bAS\b\s*\(*\s*\bSELECT\b", s))
     if re.match(r"^DROP\s+TABLE\b", s):
         return True
     if re.match(r"^ALTER\s+TABLE\b", s) or re.match(r"^ALTER\s+COLUMN\b", s):
         return True
     if re.match(r"^COLLECT\s+STATISTICS\b", s):
         return True
-    if re.match(r"^CREATE\s+(MULTISET\s+|VOLATILE\s+|GLOBAL\s+TEMPORARY\s+)?TABLE\b", s) and " AS SELECT " not in f" {s} ":
+    if re.match(r"^CREATE\s+(MULTISET\s+|VOLATILE\s+|GLOBAL\s+TEMPORARY\s+)?TABLE\b", s) and not has_select_body:
         return True
     return False
 
 
 def _extract_select_body_for_ctas(stmt: str) -> str:
-    pattern = re.compile(
-        r"^\s*(?:CREATE\s+(?:MULTISET\s+|VOLATILE\s+|GLOBAL\s+TEMPORARY\s+)?TABLE\s+.+?|REPLACE\s+(?:RECURSIVE\s+)?VIEW\s+.+?)(?=\s+SELECT\b)",
-        re.IGNORECASE | re.DOTALL,
-    )
-    if re.search(r"\bAS\s+SELECT\b", stmt, flags=re.IGNORECASE):
-        idx = re.search(r"\bSELECT\b", stmt, flags=re.IGNORECASE)
-        if idx:
-            return stmt[idx.start():]
-    if re.match(r"\s*REPLACE\s+(?:RECURSIVE\s+)?VIEW\b", stmt, flags=re.IGNORECASE):
-        idx = re.search(r"\bSELECT\b", stmt, flags=re.IGNORECASE)
-        if idx:
-            return stmt[idx.start():]
-    return pattern.sub("", stmt).strip()
+    # CTAS written as: CREATE ... AS ( SELECT ... ) WITH DATA ...
+    # Extract the balanced (...) body after AS and parse only that SELECT block.
+    as_paren = re.search(r"\bAS\s*\(", stmt, flags=re.IGNORECASE)
+    if as_paren:
+        open_idx = stmt.find("(", as_paren.start())
+        if open_idx >= 0:
+            depth = 0
+            end_idx = -1
+            for i in range(open_idx, len(stmt)):
+                ch = stmt[i]
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end_idx = i
+                        break
+            if end_idx > open_idx:
+                inner = stmt[open_idx + 1 : end_idx].strip()
+                if re.search(r"\bSELECT\b", inner, flags=re.IGNORECASE):
+                    return inner
+
+    # CTAS / REPLACE VIEW without wrapper parentheses.
+    idx = re.search(r"\bSELECT\b", stmt, flags=re.IGNORECASE)
+    if idx:
+        select_tail = stmt[idx.start():].strip()
+        # Remove trailing WITH DATA / PRIMARY INDEX clauses if present.
+        select_tail = re.sub(
+            r"\)\s*WITH\s+(?:NO\s+)?DATA\b.*$",
+            ")",
+            select_tail,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        return select_tail
+
+    return stmt.strip()
 
 
 def _parse_with_timeout(stmt: str, timeout_seconds: int) -> exp.Expression:
@@ -217,6 +241,87 @@ def _resolve_source_alias(parsed: exp.Expression, src_tbl: str) -> str:
     return ""
 
 
+def _statement_alias_sets(parsed: exp.Expression, src_table: str) -> Tuple[set, set]:
+    src_tbl = _norm(_bare_table(src_table))
+    all_aliases = set()
+    other_aliases = set()
+
+    for tbl_node in parsed.find_all(exp.Table):
+        table_name = _norm(_bare_table(tbl_node.name))
+        alias_name = _norm(str(tbl_node.alias)) if tbl_node.alias else ""
+        if table_name:
+            all_aliases.add(table_name)
+        if alias_name:
+            all_aliases.add(alias_name)
+
+        if table_name and table_name != src_tbl:
+            other_aliases.add(table_name)
+            if alias_name:
+                other_aliases.add(alias_name)
+
+    return all_aliases, other_aliases
+
+
+def _qualified_refs(expr_sql: str) -> List[Tuple[str, str]]:
+    text = _norm(expr_sql).replace('"', "")
+    refs: List[Tuple[str, str]] = []
+    pattern = re.compile(
+        r"\b(?:[A-Z_][A-Z0-9_$]*\s*\.\s*)*([A-Z_][A-Z0-9_$]*)\s*\.\s*([A-Z_][A-Z0-9_$]*)\b"
+    )
+    for match in pattern.finditer(text):
+        qualifier = _norm(match.group(1))
+        column = _norm(match.group(2))
+        refs.append((qualifier, column))
+    return refs
+
+
+def _projection_expr_sql(projection: exp.Expression) -> str:
+    if isinstance(projection, exp.Alias):
+        return projection.this.sql(dialect="teradata")
+    return projection.sql(dialect="teradata")
+
+
+def _clean_transformation_logic(logic: str, target_col: str) -> str:
+    text = _sanitize_value(logic)
+    if not text:
+        return text
+
+    specials = {
+        DIRECT_PASSTHRU,
+        TRANSFORM_NOT_FOUND,
+        STATIC_FALLBACK,
+        "PARSE_FAILED",
+        "MISSING_BOTH_COLUMNS",
+        "MISSING_SOURCE_COLUMN",
+        "MISSING_TARGET_COLUMN",
+        "NULL",
+    }
+    if _norm(text) in {_norm(x) for x in specials}:
+        if _norm(text) == _norm("direct pass through"):
+            return DIRECT_PASSTHRU
+        return text
+
+    text = re.sub(r"\s+", " ", text).strip()
+    tgt = _strip_qualifiers(target_col)
+    if tgt:
+        text = re.sub(
+            rf"(?is)^(?P<lhs>.+?)\s+AS\s+\"?{re.escape(tgt)}\"?$",
+            lambda m: m.group("lhs").strip(),
+            text,
+        )
+    text = re.sub(r"\(\s+", "(", text)
+    text = re.sub(r"\s+\)", ")", text)
+    text = re.sub(r"\s*,\s*", ", ", text)
+    return text
+
+
+def _emit_row(base: Dict[str, str], logic: str, query_uuid: str) -> Dict[str, str]:
+    out = dict(base)
+    out["transformation_logic"] = _clean_transformation_logic(logic, out.get("target_column", ""))
+    out["query_uuid"] = query_uuid
+    return out
+
+
 def _extract_from_select(parsed: exp.Expression, src_col: str, tgt_col: str) -> List[str]:
     out: List[str] = []
     tgt = _strip_qualifiers(tgt_col)
@@ -227,9 +332,9 @@ def _extract_from_select(parsed: exp.Expression, src_col: str, tgt_col: str) -> 
             alias = _norm(projection.alias_or_name or "")
             implicit = _norm(_strip_qualifiers(projection.sql(dialect="teradata")))
             if tgt and (alias == tgt or implicit == tgt):
-                out.append(projection.sql(dialect="teradata"))
+                out.append(_projection_expr_sql(projection))
             elif src and src in _norm(projection.sql(dialect="teradata")):
-                out.append(projection.sql(dialect="teradata"))
+                out.append(_projection_expr_sql(projection))
 
     seen = set()
     dedup = []
@@ -359,13 +464,7 @@ def extract_transformation(parsed: exp.Expression, src_col: str, tgt_col: str, i
     elif not isinstance(raw_logics, list):
         raw_logics = []
 
-    out: List[str] = []
-    for logic in raw_logics:
-        if _is_passthrough(logic, src_col, src_alias):
-            out.append(DIRECT_PASSTHRU)
-        else:
-            out.append(logic)
-    return list(dict.fromkeys(out))
+    return list(dict.fromkeys([logic for logic in raw_logics if logic]))
 
 
 def _extract_read_context(parsed: exp.Expression, src_col: str) -> List[str]:
@@ -408,40 +507,53 @@ def _candidate_score(
     tgt_table: str,
     expr_sql: str,
     src_table: str,
+    src_col: str,
     src_alias: str,
     parsed: exp.Expression,
 ) -> int:
     targets_match = _table_matches(tgt_table, stmt_target_table)
+    src_tbl = _norm(_bare_table(src_table))
+    src_alias_n = _norm(src_alias)
+    src_col_n = _norm(_strip_qualifiers(src_col))
     expr_norm = _norm(expr_sql)
+    qualifiers = _qualified_refs(expr_sql)
+    _, other_aliases = _statement_alias_sets(parsed, src_table)
 
-    alias_ok = True
-    if expr_sql != DIRECT_PASSTHRU and "." in expr_norm:
-        parts = [p for p in expr_norm.split(".") if p]
-        qual = parts[-2] if len(parts) >= 2 else ""
-        if src_alias:
-            if qual not in {_norm(src_alias), _norm(_bare_table(src_table))}:
-                alias_ok = False
+    source_verified = False
+    source_unverified = False
+
+    if qualifiers:
+        for qualifier, col_name in qualifiers:
+            if src_col_n and col_name != src_col_n:
+                continue
+
+            if src_alias_n:
+                if qualifier in {src_alias_n, src_tbl}:
+                    source_verified = True
+                elif qualifier in other_aliases:
+                    return 0
+            else:
+                if qualifier in other_aliases:
+                    return 0
+                if qualifier == src_tbl:
+                    source_verified = True
+                else:
+                    source_unverified = True
+    else:
+        if src_col_n and re.search(rf"(?<![A-Z0-9_]){re.escape(src_col_n)}(?![A-Z0-9_])", expr_norm):
+            source_unverified = True
+        elif src_tbl and re.search(rf"(?<![A-Z0-9_]){re.escape(src_tbl)}(?![A-Z0-9_])", expr_norm):
+            source_verified = True
         else:
-            table_aliases = set()
-            for t in parsed.find_all(exp.Table):
-                if t.alias:
-                    table_aliases.add(_norm(str(t.alias)))
-            if qual in table_aliases:
-                src_tbl_norm = _norm(_bare_table(src_table))
-                if qual != src_tbl_norm:
-                    alias_ok = False
+            source_unverified = True
 
-    if not alias_ok:
-        return 0
-
-    src_ref = _norm(_bare_table(src_table))
-    src_hit = (src_ref and src_ref in expr_norm) or (src_alias and _norm(src_alias) in expr_norm)
-
-    if targets_match and src_hit:
+    if targets_match and source_verified:
         return 3
-    if targets_match:
+    if targets_match and source_unverified:
         return 2
-    return 1
+    if source_verified or source_unverified:
+        return 1
+    return 0
 
 
 def _build_statement_catalog_for_file(
@@ -539,8 +651,8 @@ def _row_to_outputs(row: Dict[str, str], statements: Sequence[StatementInfo]) ->
             if s.parse_ok:
                 vals = _extract_static_target_logic(s.parsed, tgt_col)
                 if vals:
-                    return [{**base, "transformation_logic": "NULL", "query_uuid": s.uuid}]
-        return [{**base, "transformation_logic": "NULL", "query_uuid": default_uuid}]
+                    return [_emit_row(base, "NULL", s.uuid)]
+        return [_emit_row(base, "NULL", default_uuid)]
 
     # GATE 2
     if src_col_n == "*" or tgt_col_n == "*":
@@ -550,7 +662,7 @@ def _row_to_outputs(row: Dict[str, str], statements: Sequence[StatementInfo]) ->
             if s.parse_ok and _table_matches(tgt_table, s.target_table):
                 pick = s.uuid
                 break
-        return [{**base, "transformation_logic": text, "query_uuid": pick}]
+        return [_emit_row(base, text, pick)]
 
     # GATE 3
     if _norm(relation) == "READ" and src_col_n and not tgt_col_n:
@@ -560,17 +672,17 @@ def _row_to_outputs(row: Dict[str, str], statements: Sequence[StatementInfo]) ->
                 continue
             ctx = _extract_read_context(s.parsed, src_col)
             for c in ctx:
-                rows.append({**base, "transformation_logic": c, "query_uuid": s.uuid})
+                rows.append(_emit_row(base, c, s.uuid))
         if rows:
             return rows
 
     # GATE 4
     if not src_col_n and not tgt_col_n:
-        return [{**base, "transformation_logic": "MISSING_BOTH_COLUMNS", "query_uuid": default_uuid}]
+        return [_emit_row(base, "MISSING_BOTH_COLUMNS", default_uuid)]
     if not src_col_n:
-        return [{**base, "transformation_logic": "MISSING_SOURCE_COLUMN", "query_uuid": default_uuid}]
+        return [_emit_row(base, "MISSING_SOURCE_COLUMN", default_uuid)]
     if not tgt_col_n:
-        return [{**base, "transformation_logic": "MISSING_TARGET_COLUMN", "query_uuid": default_uuid}]
+        return [_emit_row(base, "MISSING_TARGET_COLUMN", default_uuid)]
 
     # GATE 5
     is_static = src_col_n in STATIC_MARKERS
@@ -599,7 +711,7 @@ def _row_to_outputs(row: Dict[str, str], statements: Sequence[StatementInfo]) ->
                 if k in seen:
                     continue
                 seen.add(k)
-                out.append({**base, "transformation_logic": v, "query_uuid": uid})
+                out.append(_emit_row(base, v, uid))
             return out
 
     # GATE 6
@@ -612,9 +724,18 @@ def _row_to_outputs(row: Dict[str, str], statements: Sequence[StatementInfo]) ->
         src_alias = _resolve_source_alias(s.parsed, src_table)
         logics = extract_transformation(s.parsed, src_col, tgt_col, is_static, src_alias)
         for logic in logics:
-            score = _candidate_score(s.target_table, tgt_table, logic, src_table, src_alias, s.parsed)
+            score = _candidate_score(
+                s.target_table,
+                tgt_table,
+                logic,
+                src_table,
+                src_col,
+                src_alias,
+                s.parsed,
+            )
             if score > 0:
-                candidates.append((score, logic, s.uuid))
+                logic_out = DIRECT_PASSTHRU if _is_passthrough(logic, src_col, src_alias) else logic
+                candidates.append((score, logic_out, s.uuid))
 
     if candidates:
         best = max(c[0] for c in candidates)
@@ -626,7 +747,7 @@ def _row_to_outputs(row: Dict[str, str], statements: Sequence[StatementInfo]) ->
             if key in seen:
                 continue
             seen.add(key)
-            out.append({**base, "transformation_logic": logic, "query_uuid": uid})
+            out.append(_emit_row(base, logic, uid))
         return out
 
     # POST-SCAN FALLBACK
@@ -635,13 +756,13 @@ def _row_to_outputs(row: Dict[str, str], statements: Sequence[StatementInfo]) ->
             if s.parse_ok:
                 vals = _extract_static_target_logic(s.parsed, tgt_col)
                 if vals:
-                    return [{**base, "transformation_logic": vals[0], "query_uuid": s.uuid}]
-        return [{**base, "transformation_logic": STATIC_FALLBACK, "query_uuid": default_uuid}]
+                    return [_emit_row(base, vals[0], s.uuid)]
+        return [_emit_row(base, STATIC_FALLBACK, default_uuid)]
 
     if failed:
-        return [{**base, "transformation_logic": "PARSE_FAILED", "query_uuid": failed[0].uuid}]
+        return [_emit_row(base, "PARSE_FAILED", failed[0].uuid)]
 
-    return [{**base, "transformation_logic": TRANSFORM_NOT_FOUND, "query_uuid": default_uuid}]
+    return [_emit_row(base, TRANSFORM_NOT_FOUND, default_uuid)]
 
 
 def _process_parent_group(
@@ -677,19 +798,27 @@ def _process_parent_group(
     return fact_rows, dim_rows, warnings
 
 
-def _setup_logging(output_dir: Path) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
+def _setup_logging(log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     LOGGER.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
 
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
-    fh = logging.FileHandler(output_dir / "lineage_extractor.log", encoding="utf-8")
+    fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setFormatter(fmt)
 
     LOGGER.handlers.clear()
     LOGGER.addHandler(sh)
     LOGGER.addHandler(fh)
+
+
+def _derive_output_paths(input_csv: Path, output_dir: Path) -> Tuple[Path, Path, Path]:
+    stem = input_csv.stem
+    fact_out = output_dir / f"{stem}_transformation_extract.xlsx"
+    dim_out = output_dir / f"{stem}_queries_info.xlsx"
+    log_out = output_dir / f"{stem}_logs.log"
+    return fact_out, dim_out, log_out
 
 
 def _apply_sheet_style(ws, kind: str) -> None:
@@ -812,7 +941,8 @@ def run_pipeline(
     chunksize: int,
     stmt_timeout: int = DEFAULT_STMT_TIMEOUT,
 ) -> None:
-    _setup_logging(output_dir)
+    fact_out, dim_out, log_out = _derive_output_paths(input_csv, output_dir)
+    _setup_logging(log_out)
 
     df = pd.read_csv(input_csv)
     required = ["source_table", "source_column", "target_table", "target_column", "relation", "parent", "parent_type"]
@@ -903,9 +1033,6 @@ def run_pipeline(
 
     if dim_df.empty:
         dim_df = pd.DataFrame(columns=["query_uuid", "sql_query", "file_path", "parse_status", "parse_error"])
-
-    fact_out = output_dir / "Enterprise_Fact_Lineage.xlsx"
-    dim_out = output_dir / "Enterprise_Dim_Queries.xlsx"
 
     _write_fact_workbook(fact_out, fact_df)
     _write_dim_workbook(dim_out, dim_df)
